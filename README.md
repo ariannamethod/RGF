@@ -1,0 +1,2 @@
+# RGF
+Resonant Generative Format
