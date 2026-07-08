@@ -1,0 +1,12 @@
+# Project log stays local (Oleg 2026-07-08)
+RGF_LOG.md
+
+# Artifacts — never commit weights or built files into the format repo
+*.rgf
+*.bin
+weights/
+*.o
+*.a
+rgf_pack
+rgf_viewer
+*.dSYM/
