@@ -64,10 +64,46 @@ static uint8_t* read_file(const char* path, size_t* out_len) {
 /* ── Parsed container ────────────────────────────────────────────────────── */
 typedef struct {
     const uint8_t* wght; size_t wght_len;
+    const uint8_t* mrgs; size_t mrgs_len;
     char mani[RGF_TEXT_MAX_BYTES], mcfg[RGF_TEXT_MAX_BYTES], smpl[512], rndr[512], seed[256];
-    int has_wght, has_crc0;
+    int has_wght, has_crc0, has_mrgs;
     uint32_t crc0_stored;
 } RgfDoc;
+
+/* ── Integer BPE decode (from MRGS chunk in memory) ──────────────────────────── */
+typedef struct { int* a; int* b; int n; } vbpe;
+static vbpe* vbpe_load_mem(const uint8_t* buf, size_t len) {
+    vbpe* p = (vbpe*)calloc(1, sizeof(vbpe));
+    if (!p) return NULL;
+    p->a = (int*)malloc(65536 * sizeof(int));
+    p->b = (int*)malloc(65536 * sizeof(int));
+    if (!p->a || !p->b) { free(p->a); free(p->b); free(p); return NULL; }
+    size_t i = 0;
+    while (i < len && p->n < 65536) {
+        size_t j = i; while (j < len && buf[j] != '\n') j++;
+        char line[128]; size_t ll = j - i; if (ll >= sizeof(line)) ll = sizeof(line) - 1;
+        memcpy(line, buf + i, ll); line[ll] = 0;
+        int x, y;
+        if (sscanf(line, "%d %d", &x, &y) == 2) {
+            /* causal/acyclic: merge i's operands must reference only earlier tokens
+             * (< 256 + i). Guarantees vbpe_expand terminates — reject malicious files. */
+            if (x < 0 || y < 0 || x >= 256 + p->n || y >= 256 + p->n) {
+                free(p->a); free(p->b); free(p); return NULL;
+            }
+            p->a[p->n] = x; p->b[p->n] = y; p->n++;
+        }
+        i = (j < len) ? j + 1 : len;
+    }
+    return p;
+}
+static int vbpe_expand(const vbpe* p, int id, unsigned char* o, int cap, int pos) {
+    if (pos >= cap) return pos;
+    if (id < 256) { o[pos++] = (unsigned char)id; return pos; }
+    int m = id - 256; if (m < 0 || m >= p->n) return pos;   /* invalid id → skip */
+    pos = vbpe_expand(p, p->a[m], o, cap, pos);
+    return vbpe_expand(p, p->b[m], o, cap, pos);
+}
+static void vbpe_free(vbpe* p) { if (!p) return; free(p->a); free(p->b); free(p); }
 
 static int cfg_int(const char* txt, const char* key, int def) {
     const char* p = strstr(txt, key);
@@ -120,7 +156,8 @@ static int rgf_parse(const uint8_t* buf, size_t n, RgfDoc* d) {
         }
 
         /* length caps by class (untrusted input) */
-        uint32_t cap = (tag == RGF_TAG_WGHT) ? RGF_WGHT_MAX_BYTES : RGF_TEXT_MAX_BYTES;
+        uint32_t cap = (tag == RGF_TAG_WGHT) ? RGF_WGHT_MAX_BYTES
+                     : (tag == RGF_TAG_MRGS) ? RGF_MRGS_MAX_BYTES : RGF_TEXT_MAX_BYTES;
         if (len > cap) { fprintf(stderr, "rgf: chunk 0x%08X length %u exceeds cap %u\n", tag, len, cap); return -1; }
         if (p + 8 + (size_t)len > n) { fprintf(stderr, "rgf: chunk 0x%08X runs past end\n", tag); return -1; }
 
@@ -131,7 +168,12 @@ static int rgf_parse(const uint8_t* buf, size_t n, RgfDoc* d) {
             case RGF_TAG_SMPL: copy_text(d->smpl, sizeof(d->smpl), payload, len); break;
             case RGF_TAG_RNDR: copy_text(d->rndr, sizeof(d->rndr), payload, len); break;
             case RGF_TAG_SEED: copy_text(d->seed, sizeof(d->seed), payload, len); break;
-            case RGF_TAG_WGHT: d->wght = payload; d->wght_len = len; d->has_wght = 1; break;
+            case RGF_TAG_MRGS:
+                if (d->has_crc0 || d->has_mrgs) { fprintf(stderr, "rgf: MRGS after CRC0 or duplicate — refusing\n"); return -1; }
+                d->mrgs = payload; d->mrgs_len = len; d->has_mrgs = 1; break;
+            case RGF_TAG_WGHT:
+                if (d->has_crc0 || d->has_wght) { fprintf(stderr, "rgf: WGHT after CRC0 or duplicate — refusing\n"); return -1; }
+                d->wght = payload; d->wght_len = len; d->has_wght = 1; break;
             case RGF_TAG_END:  saw_end = 1; break;
             default: /* unknown tag: skip by length (forward-compat) — only reached after CRC ok */ break;
         }
@@ -143,14 +185,16 @@ static int rgf_parse(const uint8_t* buf, size_t n, RgfDoc* d) {
 
     if (!d->has_crc0) { fprintf(stderr, "rgf: no CRC0 chunk — refusing\n"); return -1; }
     if (!d->has_wght) { fprintf(stderr, "rgf: no WGHT chunk — refusing\n"); return -1; }
+    if (!d->has_mrgs) { fprintf(stderr, "rgf: no MRGS chunk (BPE merges) — refusing\n"); return -1; }
     return 0;
 }
 
 /* ── ANSI render: crystallising text from noise (palette=blood) ──────────── */
 /* mask token → dim glyph-noise; a byte that just resolved → bright (red→white);
  * settled bytes fade toward grey. 256-colour terminal. */
-static void render_frame(const int* toks, int ctx, int mask_tok, const int* prev) {
-    fputs("\x1b[H", stdout);  /* cursor home (no full clear → less flicker) */
+static void render_frame(const int* toks, int ctx, int mask_tok, const int* prev, const vbpe* bpe) {
+    fputs("\x1b[H\x1b[J", stdout);  /* home + clear-to-end (token widths vary) */
+    unsigned char tmp[512];
     for (int i = 0; i < ctx; i++) {
         int t = toks[i];
         if (t == mask_tok) {
@@ -160,9 +204,12 @@ static void render_frame(const int* toks, int ctx, int mask_tok, const int* prev
         } else {
             int fresh = prev && prev[i] == mask_tok;   /* resolved THIS step */
             int color = fresh ? 231 : 174;             /* 231 white (fresh), 174 dusty-rose (settled) */
-            unsigned char c = (unsigned char)t;
-            if (c < 32 || c > 126) c = '.';
-            printf("\x1b[38;5;%dm%c", color, c);
+            int nb = vbpe_expand(bpe, t, tmp, (int)sizeof(tmp), 0);   /* token → its bytes */
+            printf("\x1b[38;5;%dm", color);
+            for (int k = 0; k < nb; k++) {
+                unsigned char c = tmp[k];
+                putchar((c >= 32 && c < 127) ? (char)c : (c == '\n' ? ' ' : '.'));
+            }
         }
     }
     fputs("\x1b[0m\n", stdout);
@@ -172,11 +219,13 @@ static void render_frame(const int* toks, int ctx, int mask_tok, const int* prev
 int main(int argc, char** argv) {
     const char* path = NULL;
     int once = 0, dump = 0, fps = 12; long seed_override = -1;
+    const char* prime = NULL;
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--once")) once = 1;
         else if (!strcmp(argv[i], "--dump")) dump = 1;
-        else if (!strcmp(argv[i], "--seed") && i+1 < argc) seed_override = atol(argv[++i]);
-        else if (!strcmp(argv[i], "--fps")  && i+1 < argc) fps = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--seed")  && i+1 < argc) seed_override = atol(argv[++i]);
+        else if (!strcmp(argv[i], "--fps")   && i+1 < argc) fps = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--prime") && i+1 < argc) prime = argv[++i];
         else if (argv[i][0] != '-') path = argv[i];
         else { fprintf(stderr, "rgf_viewer: unknown arg %s\n", argv[i]); return 2; }
     }
@@ -202,6 +251,13 @@ int main(int argc, char** argv) {
         free(buf); return 1;
     }
 
+    /* Load BPE merges from the MRGS chunk in memory — decodes tokens → text. */
+    vbpe* bpe = vbpe_load_mem(d.mrgs, d.mrgs_len);
+    if (!bpe || bpe->n == 0) {
+        fprintf(stderr, "rgf_viewer: MRGS load failed / empty\n");
+        vbpe_free(bpe); diff_free(); free(buf); return 1;
+    }
+
     int ctx = diff_get_ctx(), mask = diff_get_mask_tok();
     int steps      = cfg_int(d.smpl, "steps", 20);
     double temp    = cfg_flt(d.smpl, "temperature", 0.8);
@@ -220,13 +276,19 @@ int main(int argc, char** argv) {
     fputs("\x1b[2J", stdout);  /* clear once at start */
     long frame_us = (fps > 0) ? 1000000L / fps : 0;
 
+    int plen = prime ? (int)strlen(prime) : 0;
+    if (plen > ctx) plen = ctx;
+    int pstart = (ctx - plen) / 2;
+
     do {
         for (int i = 0; i < ctx; i++) toks[i] = mask;
-        /* denoise: each returned step is a frame — we render the final crystallised state.
-         * (steps_buf NULL: the engine denoises internally; we show the settled text.) */
+        /* anchor: place the prime bytes in the middle, mask the rest — the
+         * overfit model continues the corpus around the seed (Fable §3.3). */
+        for (int i = 0; i < plen; i++) toks[pstart + i] = (unsigned char)prime[i];
+        /* denoise: engine denoises internally; we show the settled text. */
         for (int i = 0; i < ctx; i++) prev[i] = mask;
         diff_denoise(toks, steps, (float)temp, NULL);
-        render_frame(toks, ctx, mask, prev);
+        render_frame(toks, ctx, mask, prev, bpe);
 
         if (once) break;
 
@@ -238,12 +300,18 @@ int main(int argc, char** argv) {
     } while (1);
 
     if (once) {
-        /* pipe-friendly proof: final crystallised text on stdout */
+        /* pipe-friendly proof: final crystallised text on stdout (BPE-decoded) */
         printf("\n[final] ");
-        for (int i = 0; i < ctx; i++) { unsigned char c = (unsigned char)toks[i]; putchar((c >= 32 && c <= 126) ? c : '.'); }
+        unsigned char tmp[512];
+        for (int i = 0; i < ctx; i++) {
+            if (toks[i] == mask) { putchar('_'); continue; }
+            int nb = vbpe_expand(bpe, toks[i], tmp, (int)sizeof(tmp), 0);
+            for (int k = 0; k < nb; k++) { unsigned char c = tmp[k]; putchar((c >= 32 && c <= 126) ? (char)c : (c == '\n' ? ' ' : '.')); }
+        }
         putchar('\n');
     }
 
+    vbpe_free(bpe);
     free(toks); free(prev); diff_free(); free(buf);
     return 0;
 }

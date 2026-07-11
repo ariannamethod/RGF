@@ -21,12 +21,12 @@
 
 /* ── Config (must match train_diffusion.c) ──────────────────────────────── */
 
-#define D_V        256
-#define D_MASK     0
-#define D_E        192
+#define D_V        2049
+#define D_MASK     2048
+#define D_E        288
 #define D_H        6
 #define D_HD       (D_E / D_H)
-#define D_FFN      768
+#define D_FFN      1152
 #define D_CTX      128
 #define D_N_LAYERS 6
 #define D_T_MAX    1000
@@ -290,8 +290,9 @@ static void forward_pass(DiffWeights* w, int* tokens, int t, float* logits_out) 
     }
 }
 
-/* ── Sampling ────────────────────────────────────────────────────────────── */
-
+/* Random-sample from logits — used only by the standalone main() demo below.
+ * (diff_denoise now uses MaskGIT confidence-ordered reveal, not this.) */
+#ifndef DIFFUSION_LIB_ONLY
 static int sample_from_logits(float* logits, float temperature, int avoid_mask) {
     for (int v = 0; v < D_V; v++) logits[v] /= temperature;
     float mx = logits[0];
@@ -305,13 +306,13 @@ static int sample_from_logits(float* logits, float temperature, int avoid_mask) 
     int chosen = 0;
     for (int v = 0; v < D_V; v++) { cum += logits[v]; if (cum >= r) { chosen = v; break; } }
 
-    /* Avoid MASK token in output */
     if (avoid_mask && chosen == D_MASK) {
         float best = -1; chosen = ' ';
         for (int v = 1; v < D_V; v++) if (logits[v] > best) { best = logits[v]; chosen = v; }
     }
     return chosen;
 }
+#endif
 
 /* ── Public API (for ctypes) ─────────────────────────────────────────────── */
 
@@ -366,7 +367,7 @@ void diff_forward_pass(int* tokens_in, int t, float* logits_out) {
 int diff_denoise(int* tokens_io, int n_steps, float temperature, int* steps_buf) {
     if (!g_weights || !g_scratch) return 0;
 
-    float logits[D_CTX * D_V];
+    static float logits[D_CTX * D_V];  /* ~1 MB — static, not stack (portability) */
 
     for (int step = 0; step < n_steps; step++) {
         int t = D_T_MAX - (step * D_T_MAX / n_steps);
@@ -380,18 +381,43 @@ int diff_denoise(int* tokens_io, int n_steps, float temperature, int* steps_buf)
                 steps_buf[step * D_CTX + i] = tokens_io[i];
         }
 
-        /* Reveal masked positions */
-        float reveal_prob = 1.0f / (float)(n_steps - step);
+        /* MaskGIT confidence-ordered PERMANENT reveal (pure argmax): commit the k
+         * most-confident masked positions this step and keep them — correct tokens
+         * accumulate as context, growing coherent islands. Permanent commit (not
+         * re-masking) is right for a memorised passage: re-masking would discard the
+         * accumulated context each step and collapse to unigram. (temperature reserved) */
+        (void)temperature;
+        int steps_left = n_steps - step;
+        int n_masked = 0;
+        for (int i = 0; i < D_CTX; i++) if (tokens_io[i] == D_MASK) n_masked++;
+        if (n_masked == 0) break;
+        int k = (n_masked + steps_left - 1) / steps_left;   /* ceil(n_masked / steps_left) */
+        struct { int pos, tok; float conf; } cand[D_CTX];
+        int nc = 0;
         for (int i = 0; i < D_CTX; i++) {
-            if (tokens_io[i] == D_MASK) {
-                float r = (float)rand() / (float)RAND_MAX;
-                if (r < reveal_prob || step == n_steps - 1) {
-                    /* Copy logits for this position (sample_from_logits modifies in place) */
-                    float pos_logits[D_V];
-                    memcpy(pos_logits, logits + i * D_V, D_V * sizeof(float));
-                    tokens_io[i] = sample_from_logits(pos_logits, temperature, 1);
-                }
+            if (tokens_io[i] != D_MASK) continue;
+            const float* lg = logits + i * D_V;
+            float mx = -1e30f;
+            for (int v = 0; v < D_V; v++) if (v != D_MASK && lg[v] > mx) mx = lg[v];
+            float sum = 0;
+            for (int v = 0; v < D_V; v++) if (v != D_MASK) sum += expf(lg[v] - mx);
+            if (sum <= 0) sum = 1;
+            int best = ' '; float pbest = -1.0f;
+            for (int v = 0; v < D_V; v++) {
+                if (v == D_MASK) continue;
+                float p = expf(lg[v] - mx) / sum;
+                if (p > pbest) { pbest = p; best = v; }
             }
+            cand[nc].pos = i; cand[nc].tok = best; cand[nc].conf = pbest; nc++;
+        }
+        for (int c = 0; c < k && c < nc; c++) {
+            int bi = c;
+            for (int j = c + 1; j < nc; j++) if (cand[j].conf > cand[bi].conf) bi = j;
+            if (bi != c) {
+                int pp = cand[bi].pos, tt = cand[bi].tok; float cf = cand[bi].conf;
+                cand[bi] = cand[c]; cand[c].pos = pp; cand[c].tok = tt; cand[c].conf = cf;
+            }
+            tokens_io[cand[c].pos] = cand[c].tok;
         }
     }
     return n_steps;

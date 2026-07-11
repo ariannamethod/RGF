@@ -33,17 +33,26 @@ them.
 
 ## Status — v0.1 (proof-of-life)
 
-The full vertical is verified end-to-end on the real Dracula Diffusion model (3.74M
-params, byte-level, trained to loss ~0.08 — deep overfit by design): `train →
-weights → pack → .rgf → viewer → parse → load-from-memory → denoise → visual`. The
-parser is hardened against untrusted input (magic, tag-whitelist, length caps, CRC32
-verified before the blob is used, ndim guards on the weight loader) — corrupt files
-are refused, never crashed (fuzz-checked under ASan).
+The full vertical is proven end-to-end (`train → weights → pack → .rgf → viewer →
+parse → load-from-memory → BPE-decode → denoise → visual`) on a real BPE Dracula
+Diffusion model (V=2049 = 2048 merges + MASK, E288/FFN1152/6L, ~9.35M params). The
+container carries its own tokenizer (`MRGS` chunk = the merge table), so the viewer
+detokenises without any external file. A passage-overfit demo model **reveals a
+recognisable Dracula passage from pure noise** — the memorised skeleton reads through
+the MaskGIT denoise (*"which I got of it from the train … from the station, as we …
+depth, took us am"*). The parser is hardened against untrusted input (magic,
+tag-whitelist, length caps, CRC32 verified before use, `MRGS`/`WGHT` rejected after
+`CRC0` or when duplicated, merges validated causal so decode can't recurse unboundedly)
+— corrupt files are refused, never crashed.
 
-**Honest scope:** the denoised text is *fabric, not prose* — an English-textured
-ripple of the corpus, not readable sentences. This is proof-of-life of the medium
-(the denoise-animation is alive), not literature. Coherence is a tuning/scale
-question, not a claim this release makes.
+**Honest scope:** the demo model is *overfit on one passage* — it breathes that
+passage, recognisably, with cold-start filler noise where the reveal commits before
+context accrues. Cleaner prose is a seeding / longer-training knob; full-corpus
+coherence is a separate training-scale question (a byte/small model plateaus at the
+marginal until it is trained past it — the wall was a permanent optimiser freeze,
+now removed, plus scale). What v0.1 proves: the medium is real — conditioned weights
+in a file denoise into legible text, and the container is a hardened, self-contained
+tokeniser+model that any decoder can breathe.
 
 ## Spec
 

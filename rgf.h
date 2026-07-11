@@ -27,6 +27,7 @@
 #define RGF_TAG_SMPL 0x4C504D53  /* "SMPL" — sampler (steps/temp/remask/hold_ms) */
 #define RGF_TAG_RNDR 0x52444E52  /* "RNDR" — render (mode/palette/fps) */
 #define RGF_TAG_SEED 0x44454553  /* "SEED" — seed policy */
+#define RGF_TAG_MRGS 0x5347524D  /* "MRGS" — BPE merges (integer "id_a id_b" text, verbatim) */
 #define RGF_TAG_WGHT 0x54484757  /* "WGHT" — weight blob (verbatim notorch dump) */
 #define RGF_TAG_CRC0 0x30435243  /* "CRC0" — u32 crc32 of all bytes before this chunk */
 #define RGF_TAG_END  0x00444E45  /* "END\0" — terminator (length 0) */
@@ -34,13 +35,14 @@
 /* Chunk length caps — untrusted input, refuse absurd sizes (Fable §4.2). */
 #define RGF_WGHT_MAX_BYTES (64u * 1024u * 1024u)  /* 64 MB — f32 blob ~15 MB, headroom */
 #define RGF_TEXT_MAX_BYTES (64u * 1024u)          /* 64 KB — text chunks */
+#define RGF_MRGS_MAX_BYTES (256u * 1024u)         /* 256 KB — BPE merges text (1792 merges ~14 KB, headroom) */
 
 /* ── Model config (MUST match diffusion_engine.c D_* — mirrored, verified) ── */
 
-#define RGF_V         256   /* vocab, byte-level                     */
-#define RGF_E         192   /* embedding dim                         */
+#define RGF_V         2049  /* vocab (2048 BPE merges-vocab + MASK)   */
+#define RGF_E         288   /* embedding dim                         */
 #define RGF_HEADS     6     /* attention heads                       */
-#define RGF_FFN       768   /* feed-forward dim                      */
+#define RGF_FFN       1152  /* feed-forward dim                      */
 #define RGF_CTX       128   /* context length (bytes)                */
 #define RGF_N_LAYERS  6     /* transformer layers                    */
 #define RGF_T_MAX     1000  /* diffusion timesteps                   */
@@ -58,18 +60,18 @@ typedef struct { int ndim; int dims[2]; } rgf_shape;
 
 /* 60 tensors: [wte wpe t_proj1 t_proj2] + 6×[rms1 wq wk wv wo rms2 w_gate w_up w_down] + [rms_f head] */
 static const rgf_shape RGF_TENSOR_SHAPES[RGF_N_TENSORS] = {
-    RGF_MAT(256, 192),  /* wte   [V, E]   */
-    RGF_MAT(128, 192),  /* wpe   [CTX, E] */
-    RGF_MAT(192, 192),  /* t_proj1 [E, E] */
-    RGF_MAT(192, 192),  /* t_proj2 [E, E] */
-    /* layer 0 */ RGF_VEC(192), RGF_MAT(192,192), RGF_MAT(192,192), RGF_MAT(192,192), RGF_MAT(192,192), RGF_VEC(192), RGF_MAT(768,192), RGF_MAT(768,192), RGF_MAT(192,768),
-    /* layer 1 */ RGF_VEC(192), RGF_MAT(192,192), RGF_MAT(192,192), RGF_MAT(192,192), RGF_MAT(192,192), RGF_VEC(192), RGF_MAT(768,192), RGF_MAT(768,192), RGF_MAT(192,768),
-    /* layer 2 */ RGF_VEC(192), RGF_MAT(192,192), RGF_MAT(192,192), RGF_MAT(192,192), RGF_MAT(192,192), RGF_VEC(192), RGF_MAT(768,192), RGF_MAT(768,192), RGF_MAT(192,768),
-    /* layer 3 */ RGF_VEC(192), RGF_MAT(192,192), RGF_MAT(192,192), RGF_MAT(192,192), RGF_MAT(192,192), RGF_VEC(192), RGF_MAT(768,192), RGF_MAT(768,192), RGF_MAT(192,768),
-    /* layer 4 */ RGF_VEC(192), RGF_MAT(192,192), RGF_MAT(192,192), RGF_MAT(192,192), RGF_MAT(192,192), RGF_VEC(192), RGF_MAT(768,192), RGF_MAT(768,192), RGF_MAT(192,768),
-    /* layer 5 */ RGF_VEC(192), RGF_MAT(192,192), RGF_MAT(192,192), RGF_MAT(192,192), RGF_MAT(192,192), RGF_VEC(192), RGF_MAT(768,192), RGF_MAT(768,192), RGF_MAT(192,768),
-    RGF_VEC(192),       /* rms_f [E]     */
-    RGF_MAT(256, 192),  /* head  [V, E]  */
+    RGF_MAT(2049, 288), /* wte   [V, E]   */
+    RGF_MAT(128, 288),  /* wpe   [CTX, E] */
+    RGF_MAT(288, 288),  /* t_proj1 [E, E] */
+    RGF_MAT(288, 288),  /* t_proj2 [E, E] */
+    /* layer 0 */ RGF_VEC(288), RGF_MAT(288,288), RGF_MAT(288,288), RGF_MAT(288,288), RGF_MAT(288,288), RGF_VEC(288), RGF_MAT(1152,288), RGF_MAT(1152,288), RGF_MAT(288,1152),
+    /* layer 1 */ RGF_VEC(288), RGF_MAT(288,288), RGF_MAT(288,288), RGF_MAT(288,288), RGF_MAT(288,288), RGF_VEC(288), RGF_MAT(1152,288), RGF_MAT(1152,288), RGF_MAT(288,1152),
+    /* layer 2 */ RGF_VEC(288), RGF_MAT(288,288), RGF_MAT(288,288), RGF_MAT(288,288), RGF_MAT(288,288), RGF_VEC(288), RGF_MAT(1152,288), RGF_MAT(1152,288), RGF_MAT(288,1152),
+    /* layer 3 */ RGF_VEC(288), RGF_MAT(288,288), RGF_MAT(288,288), RGF_MAT(288,288), RGF_MAT(288,288), RGF_VEC(288), RGF_MAT(1152,288), RGF_MAT(1152,288), RGF_MAT(288,1152),
+    /* layer 4 */ RGF_VEC(288), RGF_MAT(288,288), RGF_MAT(288,288), RGF_MAT(288,288), RGF_MAT(288,288), RGF_VEC(288), RGF_MAT(1152,288), RGF_MAT(1152,288), RGF_MAT(288,1152),
+    /* layer 5 */ RGF_VEC(288), RGF_MAT(288,288), RGF_MAT(288,288), RGF_MAT(288,288), RGF_MAT(288,288), RGF_VEC(288), RGF_MAT(1152,288), RGF_MAT(1152,288), RGF_MAT(288,1152),
+    RGF_VEC(288),       /* rms_f [E]     */
+    RGF_MAT(2049, 288), /* head  [V, E]  */
 };
 
 #endif /* RGF_H */

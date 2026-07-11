@@ -26,6 +26,7 @@ check passes.
 | `SMPL` | sampler: steps, temperature, remask, hold_ms                             | yes |
 | `RNDR` | render: mode (`NOISE_TO_TEXT`), palette, fps                             | yes |
 | `SEED` | seed policy: policy (`time`\|`fixed`\|`random`), value                    | yes |
+| `MRGS` | BPE merges — verbatim integer `id_a id_b` text (base 256 bytes + merges)  | yes |
 | `WGHT` | weight blob — verbatim notorch dump (magic `0x4E544F52` + 60 tensors)     | yes |
 | `CRC0` | u32 crc32 (IEEE, poly `0xEDB88320`) of all bytes before this chunk        | yes |
 | `END`  | terminator, length 0                                                      | yes |
@@ -39,8 +40,9 @@ v0.2 adds `q8` (~3.8 MB) without breaking the format.
 `.rgf` opens with other people's bytes. The parser enforces:
 
 - magic + version check;
-- per-chunk length caps: `WGHT ≤ 64 MB`, text chunks `≤ 64 KB`;
-- no read past end of buffer;
+- per-chunk length caps: `WGHT ≤ 64 MB`, `MRGS ≤ 256 KB`, text chunks `≤ 64 KB`;
+- no read past end of buffer; `MRGS`/`WGHT` rejected if seen after `CRC0` or duplicated;
+- `MRGS` merges validated causal/acyclic at load (operands of merge `i` < `256+i`) — no unbounded decode recursion;
 - `CRC0` verified before the weight blob is used;
 - forced NUL-termination on text chunks;
 - the weight loader guards `ndim` and every shape (the engine's `load_mat`/`load_vec`).
@@ -53,9 +55,9 @@ The `WGHT` payload is a verbatim notorch dump: `u32 magic (0x4E544F52)`, `i32 co
 — the architecture-fixed shape of all 60 tensors, in `load_weights` order:
 
 ```
-wte[256,192] wpe[128,192] t_proj1[192,192] t_proj2[192,192]
-× 6 layers: rms1[192] wq/wk/wv/wo[192,192] rms2[192] w_gate/w_up[768,192] w_down[192,768]
-rms_f[192] head[256,192]
+wte[2049,288] wpe[128,288] t_proj1[288,288] t_proj2[288,288]
+× 6 layers: rms1[288] wq/wk/wv/wo[288,288] rms2[288] w_gate/w_up[1152,288] w_down[288,1152]
+rms_f[288] head[2049,288]
 ```
 
 A blob with a mismatched shape is refused, not sealed into the format.

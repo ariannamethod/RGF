@@ -103,7 +103,7 @@ static void write_chunk(FILE* f, uint32_t* crc, uint32_t tag, const void* payloa
 }
 
 int main(int argc, char** argv) {
-    const char *weights = NULL, *out = NULL, *title = "Untitled";
+    const char *weights = NULL, *out = NULL, *title = "Untitled", *merges = NULL;
     const char *author = "Arianna Method", *organism = "dracula-diffusion-v1", *corpus = "dracula.txt";
     const char *seed_policy = "time"; long seed_value = 0;
     int steps = 20; double temp = 0.8, remask = 0.4;
@@ -119,10 +119,11 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--steps")   && i+1 < argc) steps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--temp")    && i+1 < argc) temp = atof(argv[++i]);
         else if (!strcmp(argv[i], "--remask")  && i+1 < argc) remask = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--merges")  && i+1 < argc) merges = argv[++i];
         else { fprintf(stderr, "rgf_pack: unknown arg %s\n", argv[i]); return 2; }
     }
-    if (!weights || !out) {
-        fprintf(stderr, "usage: rgf_pack --weights W.bin --out F.rgf --title T [opts]\n");
+    if (!weights || !out || !merges) {
+        fprintf(stderr, "usage: rgf_pack --weights W.bin --merges M.txt --out F.rgf --title T [opts]\n");
         return 2;
     }
 
@@ -165,6 +166,17 @@ int main(int argc, char** argv) {
 
     m = snprintf(buf, sizeof(buf), "policy=%s\nvalue=%ld\n", seed_policy, seed_value);
     write_chunk(f, &crc, RGF_TAG_SEED, buf, (uint32_t)m);
+
+    /* MRGS: BPE merges (verbatim integer "id_a id_b" text) so the viewer decodes tokens */
+    size_t mrgs_len = 0;
+    uint8_t* mrgs = read_file(merges, &mrgs_len);
+    if (!mrgs) { fprintf(stderr, "rgf_pack: cannot read merges %s\n", merges); fclose(f); free(blob); return 1; }
+    if (mrgs_len == 0 || mrgs_len > RGF_MRGS_MAX_BYTES) {
+        fprintf(stderr, "rgf_pack: merges %zu bytes invalid (cap %u)\n", mrgs_len, RGF_MRGS_MAX_BYTES);
+        fclose(f); free(blob); free(mrgs); return 1;
+    }
+    write_chunk(f, &crc, RGF_TAG_MRGS, (const char*)mrgs, (uint32_t)mrgs_len);
+    free(mrgs);
 
     write_chunk(f, &crc, RGF_TAG_WGHT, blob, (uint32_t)blob_len);
 
